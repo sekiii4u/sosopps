@@ -1,0 +1,3 @@
+[functions.protected-delete]
+# The endpoint is intentionally callable without user accounts; it enforces its own password check.
+verify_jwt = false
