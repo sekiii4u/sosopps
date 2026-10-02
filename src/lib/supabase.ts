@@ -32,6 +32,7 @@ const mapPlatform = (row: any): Platform => ({
   name: row.name,
   active: row.active,
   color: row.color ?? '#536fe4',
+  dailyTarget: row.daily_target ?? 0,
   notes: row.notes ?? '',
 });
 const mapDevice = (row: any): Device => ({
@@ -119,6 +120,7 @@ export async function saveRemoteStore(store: Store): Promise<void> {
         name: row.name,
         active: row.active,
         color: row.color,
+        daily_target: row.dailyTarget,
         notes: row.notes || null,
       }))
     ),
@@ -167,6 +169,76 @@ export async function saveRemoteStore(store: Store): Promise<void> {
       remark: row.remark || null,
     }))
   );
+}
+
+export async function saveRemotePost(post: Post): Promise<void> {
+  if (!supabase) return;
+  const { error } = await supabase.from('posts').upsert({
+    id: post.id,
+    post_date: post.date,
+    post_time: post.time,
+    client_id: post.clientId,
+    account_id: post.accountId,
+    platform_id: post.platformId,
+    device_id: post.deviceId || null,
+    content_id: post.contentId || null,
+    content_type: post.contentType,
+    status: post.status,
+    operator: post.operator || null,
+    url: post.url || null,
+    remark: post.remark || null,
+  });
+  if (error) throw new Error(error.message);
+}
+
+export async function saveRemoteRecord(
+  type: 'clients' | 'accounts' | 'platforms' | 'devices',
+  value: any
+): Promise<void> {
+  if (!supabase) return;
+  const payload =
+    type === 'clients'
+      ? {
+          id: value.id,
+          name: value.name,
+          contact: value.contact || null,
+          daily_target: value.dailyTarget,
+          status: value.status,
+          remarks: value.remarks || null,
+        }
+      : type === 'platforms'
+        ? {
+            id: value.id,
+            name: value.name,
+            active: value.active,
+            color: value.color,
+            daily_target: value.dailyTarget,
+            notes: value.notes || null,
+          }
+        : type === 'devices'
+          ? {
+              id: value.id,
+              name: value.name,
+              type: value.type,
+              assigned_to: value.assignedTo || null,
+              status: value.status,
+              remarks: value.remarks || null,
+            }
+          : {
+              id: value.id,
+              client_id: value.clientId,
+              platform_id: value.platformId,
+              name: value.name,
+              device_id: value.deviceId || null,
+              phone: value.phone || null,
+              email: value.email || null,
+              status: value.status,
+              daily_target: value.dailyTarget,
+              remarks: value.remarks || null,
+            };
+  const client = supabase as any;
+  const { error } = await client.from(type).upsert(payload);
+  if (error) throw new Error(error.message);
 }
 
 export async function requestProtectedDelete(

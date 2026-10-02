@@ -1,3 +1,16 @@
 [functions.protected-delete]
-# The endpoint is intentionally callable without user accounts; it enforces its own password check.
+# Edge runtime JWT checks are disabled so the function can return its own consistent 401/403 responses.
+# The function itself requires a valid bearer token, an admin profile, and the separate delete passphrase.
 verify_jwt = false
+
+[functions.bootstrap-admin]
+# First-admin creation is protected by a one-time server-side bootstrap secret and closes after one admin exists.
+verify_jwt = false
+
+[functions.provision-client]
+# Admin role is verified in the function from the submitted access token.
+verify_jwt = false
+
+[auth]
+# Auth identities are created only by the protected bootstrap/provisioning functions.
+enable_signup = false

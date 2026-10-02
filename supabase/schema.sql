@@ -1,5 +1,5 @@
 -- Social Ops schema. Run once in the Supabase SQL Editor.
--- Anonymous teammates can read/create/update operational rows; DELETE is intentionally server-only.
+-- Access requires an authenticated role profile; clients are scoped to their own client data.
 create extension if not exists pgcrypto;
 
 create table if not exists public.clients (
@@ -17,9 +17,11 @@ create table if not exists public.platforms (
   name text not null unique,
   active boolean not null default true,
   color text not null default '#536fe4',
+  daily_target integer not null default 0 check (daily_target >= 0),
   notes text,
   created_at timestamptz not null default now()
 );
+alter table public.platforms add column if not exists daily_target integer not null default 0 check (daily_target >= 0);
 
 create table if not exists public.devices (
   id text primary key,
@@ -63,10 +65,85 @@ create table if not exists public.posts (
   created_at timestamptz not null default now()
 );
 
+-- Upgrade installations that used the earlier posted_at timestamp column.
+alter table public.posts add column if not exists post_date date;
+alter table public.posts add column if not exists post_time time;
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'posts' and column_name = 'posted_at'
+  ) then
+    execute 'update public.posts set post_date = coalesce(post_date, posted_at::date), post_time = coalesce(post_time, posted_at::time)';
+    execute 'alter table public.posts alter column posted_at drop not null';
+  end if;
+  update public.posts set post_date = coalesce(post_date, created_at::date), post_time = coalesce(post_time, time '00:00');
+  alter table public.posts alter column post_date set not null;
+  alter table public.posts alter column post_time set not null;
+end $$;
+
 create index if not exists posts_posted_date_time_idx on public.posts (post_date desc, post_time desc);
 create index if not exists posts_client_id_idx on public.posts (client_id);
 create index if not exists posts_platform_id_idx on public.posts (platform_id);
 create index if not exists accounts_client_id_idx on public.accounts (client_id);
+
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  username text not null unique,
+  role text not null check (role in ('admin', 'client')),
+  client_id text references public.clients(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  check ((role = 'admin' and client_id is null) or (role = 'client' and client_id is not null))
+);
+alter table public.profiles enable row level security;
+
+create or replace function public.current_app_role()
+returns text
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select role from public.profiles where id = auth.uid();
+$$;
+
+create or replace function public.current_client_id()
+returns text
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select client_id from public.profiles where id = auth.uid() and role = 'client';
+$$;
+
+create or replace function public.client_can_write_post(p_client_id text, p_account_id text, p_platform_id text, p_device_id text)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select p_client_id = public.current_client_id() and exists (
+    select 1 from public.accounts a
+    where a.id = p_account_id and a.client_id = p_client_id and a.platform_id = p_platform_id
+      and a.device_id is not distinct from p_device_id
+  );
+$$;
+
+revoke all on function public.current_app_role() from public, anon;
+revoke all on function public.current_client_id() from public, anon;
+revoke all on function public.client_can_write_post(text, text, text, text) from public, anon;
+grant execute on function public.current_app_role(), public.current_client_id(), public.client_can_write_post(text, text, text, text) to authenticated;
+
+insert into public.platforms (id, name, active, color, daily_target, notes) values
+  ('PLT-001', 'Instagram', true, '#d94e8f', 15, 'Meta'),
+  ('PLT-002', 'TikTok', true, '#1d222a', 10, 'Short form video'),
+  ('PLT-003', 'Facebook', true, '#4d79df', 7, 'Meta'),
+  ('PLT-004', 'YouTube', true, '#ea5555', 3, 'Video channel'),
+  ('PLT-005', 'X', false, '#69727f', 0, 'Not currently used')
+on conflict (name) do update set daily_target = excluded.daily_target
+where public.platforms.daily_target = 0;
 
 -- Private server-side failure counter for password-guessing protection.
 create table if not exists public.delete_attempt_limits (
@@ -133,6 +210,10 @@ alter table public.platforms enable row level security;
 alter table public.devices enable row level security;
 alter table public.accounts enable row level security;
 alter table public.posts enable row level security;
+revoke all on public.profiles from anon, authenticated;
+grant select on public.profiles to authenticated;
+drop policy if exists "profile owner can read" on public.profiles;
+create policy "profile owner can read" on public.profiles for select to authenticated using (id = auth.uid());
 
 do $$
 declare table_name text;
@@ -141,13 +222,29 @@ begin
     execute format('drop policy if exists "public read" on public.%I', table_name);
     execute format('drop policy if exists "public insert" on public.%I', table_name);
     execute format('drop policy if exists "public update" on public.%I', table_name);
-    execute format('create policy "public read" on public.%I for select to anon, authenticated using (true)', table_name);
-    execute format('create policy "public insert" on public.%I for insert to anon, authenticated with check (true)', table_name);
-    execute format('create policy "public update" on public.%I for update to anon, authenticated using (true) with check (true)', table_name);
+    execute format('drop policy if exists "admin full access" on public.%I', table_name);
+    execute format('drop policy if exists "client scoped read" on public.%I', table_name);
+    execute format('drop policy if exists "client insert own posts" on public.%I', table_name);
+    execute format('drop policy if exists "client update own posts" on public.%I', table_name);
   end loop;
 end $$;
 
--- PostgREST permissions: no DELETE grant for anon/authenticated clients.
-grant usage on schema public to anon, authenticated;
-grant select, insert, update on public.clients, public.platforms, public.devices, public.accounts, public.posts to anon, authenticated;
-revoke delete on public.clients, public.platforms, public.devices, public.accounts, public.posts from anon, authenticated;
+create policy "admin full access" on public.clients for all to authenticated using (public.current_app_role() = 'admin') with check (public.current_app_role() = 'admin');
+create policy "client scoped read" on public.clients for select to authenticated using (id = public.current_client_id());
+create policy "admin full access" on public.platforms for all to authenticated using (public.current_app_role() = 'admin') with check (public.current_app_role() = 'admin');
+create policy "client scoped read" on public.platforms for select to authenticated using (exists (select 1 from public.accounts a where a.client_id = public.current_client_id() and a.platform_id = platforms.id));
+create policy "admin full access" on public.devices for all to authenticated using (public.current_app_role() = 'admin') with check (public.current_app_role() = 'admin');
+create policy "client scoped read" on public.devices for select to authenticated using (exists (select 1 from public.accounts a where a.client_id = public.current_client_id() and a.device_id = devices.id));
+create policy "admin full access" on public.accounts for all to authenticated using (public.current_app_role() = 'admin') with check (public.current_app_role() = 'admin');
+create policy "client scoped read" on public.accounts for select to authenticated using (client_id = public.current_client_id());
+create policy "admin full access" on public.posts for all to authenticated using (public.current_app_role() = 'admin') with check (public.current_app_role() = 'admin');
+create policy "client scoped read" on public.posts for select to authenticated using (client_id = public.current_client_id());
+create policy "client insert own posts" on public.posts for insert to authenticated with check (public.client_can_write_post(client_id, account_id, platform_id, device_id));
+create policy "client update own posts" on public.posts for update to authenticated using (client_id = public.current_client_id()) with check (public.client_can_write_post(client_id, account_id, platform_id, device_id));
+
+-- No anonymous table access. Authenticated admins and clients can read the rows allowed by RLS.
+grant usage on schema public to authenticated, service_role;
+revoke all on public.clients, public.platforms, public.devices, public.accounts, public.posts from anon, authenticated;
+grant select, insert, update, delete on public.clients, public.platforms, public.devices, public.accounts, public.posts to authenticated;
+grant all on public.profiles to service_role;
+revoke all on public.profiles from anon;

@@ -41,15 +41,31 @@ Deno.serve(async (request) => {
   const table = typeof payload.table === 'string' ? payload.table : '';
   const id = typeof payload.id === 'string' ? payload.id : '';
   const password = typeof payload.password === 'string' ? payload.password : '';
+  const authorization = request.headers.get('authorization');
   if (!allowedTables.has(table) || !id || id.length > 200)
     return json({ error: 'Invalid delete target.' }, 400);
-  if (!password || password !== expectedPassword)
-    return json({ error: 'Incorrect delete password.' }, 401);
+  if (!password || !authorization?.startsWith('Bearer '))
+    return json({ error: 'Sign in as an admin to delete records.' }, 401);
 
   const admin = createClient(supabaseUrl, serviceRoleKey, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
-  const clientIp = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+  const token = authorization.slice('Bearer '.length);
+  const { data: authData, error: authError } = await admin.auth.getUser(token);
+  if (authError || !authData.user)
+    return json({ error: 'Your session is invalid. Please sign in again.' }, 401);
+  const { data: profile, error: profileError } = await admin
+    .from('profiles')
+    .select('role')
+    .eq('id', authData.user.id)
+    .single();
+  if (profileError || profile?.role !== 'admin')
+    return json({ error: 'Only admins can delete records.' }, 403);
+  const clientIp =
+    request.headers.get('cf-connecting-ip') ||
+    request.headers.get('x-real-ip') ||
+    request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+    'unknown';
   const { data: blocked, error: rateLimitError } = await admin.rpc('delete_ip_is_blocked', {
     p_client_ip: clientIp,
   });

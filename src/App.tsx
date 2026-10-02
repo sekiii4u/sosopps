@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import {
   Activity,
@@ -16,7 +16,9 @@ import {
   Ellipsis,
   Filter,
   Globe2,
+  KeyRound,
   LayoutDashboard,
+  LogOut,
   Menu,
   MonitorSmartphone,
   MoreHorizontal,
@@ -43,11 +45,17 @@ import {
   YAxis,
 } from 'recharts';
 import type { Account, Client, Device, Platform, Post, Section, Status, Store } from './types';
+import type { AppProfile } from './lib/auth';
+import { appSection, getAppProfile, signOut } from './lib/auth';
+import AuthScreen from './components/AuthScreen';
+import ClientProvisionModal from './components/ClientProvisionModal';
 import {
   emptyRemoteStore,
   fetchRemoteStore,
   requestProtectedDelete,
-  saveRemoteStore,
+  saveRemotePost,
+  saveRemoteRecord,
+  supabase,
   supabaseConfigured,
 } from './lib/supabase';
 import './App.css';
@@ -74,11 +82,46 @@ const nextId = (prefix: string, rows: { id: string }[]) => {
   return `${prefix}-${String(next).padStart(3, '0')}`;
 };
 const platformSeeds: Platform[] = [
-  { id: 'PLT-001', name: 'Instagram', active: true, color: '#d94e8f', notes: 'Meta' },
-  { id: 'PLT-002', name: 'TikTok', active: true, color: '#1d222a', notes: 'Short form video' },
-  { id: 'PLT-003', name: 'Facebook', active: true, color: '#4d79df', notes: 'Meta' },
-  { id: 'PLT-004', name: 'YouTube', active: true, color: '#ea5555', notes: 'Video channel' },
-  { id: 'PLT-005', name: 'X', active: false, color: '#69727f', notes: 'Not currently used' },
+  {
+    id: 'PLT-001',
+    name: 'Instagram',
+    active: true,
+    color: '#d94e8f',
+    dailyTarget: 15,
+    notes: 'Meta',
+  },
+  {
+    id: 'PLT-002',
+    name: 'TikTok',
+    active: true,
+    color: '#1d222a',
+    dailyTarget: 10,
+    notes: 'Short form video',
+  },
+  {
+    id: 'PLT-003',
+    name: 'Facebook',
+    active: true,
+    color: '#4d79df',
+    dailyTarget: 7,
+    notes: 'Meta',
+  },
+  {
+    id: 'PLT-004',
+    name: 'YouTube',
+    active: true,
+    color: '#ea5555',
+    dailyTarget: 3,
+    notes: 'Video channel',
+  },
+  {
+    id: 'PLT-005',
+    name: 'X',
+    active: false,
+    color: '#69727f',
+    dailyTarget: 0,
+    notes: 'Not currently used',
+  },
 ];
 const clientsSeed: Client[] = [
   {
@@ -237,15 +280,6 @@ function makeSeedStore(): Store {
   return { clients: clientsSeed, platforms: platformSeeds, devices: devicesSeed, accounts, posts };
 }
 const STORAGE_KEY = 'social-ops-control-center-v1';
-function loadStore(): Store {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) return JSON.parse(saved) as Store;
-  } catch {
-    /* load the sample workspace if local storage is unavailable */
-  }
-  return makeSeedStore();
-}
 const navItems: { name: Section; icon: typeof LayoutDashboard; group: string }[] = [
   { name: 'Dashboard', icon: LayoutDashboard, group: 'WORKSPACE' },
   { name: 'Posting log', icon: Video, group: 'WORKSPACE' },
@@ -256,20 +290,15 @@ const navItems: { name: Section; icon: typeof LayoutDashboard; group: string }[]
   { name: 'History', icon: FileText, group: 'INSIGHTS' },
   { name: 'Reports', icon: BarChart3, group: 'INSIGHTS' },
 ];
-const platformTargets: Record<string, number> = {
-  Instagram: 15,
-  TikTok: 10,
-  Facebook: 7,
-  YouTube: 3,
-};
 const statusClass = (status: string) => status.toLowerCase();
 
 function App() {
-  const [store, setStore] = useState<Store>(() =>
-    supabaseConfigured ? emptyRemoteStore() : loadStore()
-  );
+  const [store, setStore] = useState<Store>(() => emptyRemoteStore());
+  const [sessionReady, setSessionReady] = useState(!supabaseConfigured);
+  const [profile, setProfile] = useState<AppProfile | null>(null);
   const [section, setSection] = useState<Section>('Dashboard');
   const [modal, setModal] = useState<'post' | 'record' | null>(null);
+  const [provisionOpen, setProvisionOpen] = useState(false);
   const [editItem, setEditItem] = useState<{ type: string; value: any } | null>(null);
   const [deleteRequest, setDeleteRequest] = useState<{
     table: 'posts' | 'clients' | 'accounts' | 'platforms' | 'devices';
@@ -289,34 +318,82 @@ function App() {
   const [mobileNav, setMobileNav] = useState(false);
 
   useEffect(() => {
-    if (!supabaseConfigured) return;
+    const client = supabase;
+    if (!supabaseConfigured || !client) return;
     let active = true;
-    fetchRemoteStore()
-      .then((remote) => {
+    const applySession = async (
+      nextSession: Awaited<ReturnType<typeof client.auth.getSession>>['data']['session']
+    ) => {
+      if (!active) return;
+      if (!nextSession) {
+        setProfile(null);
+        setStore(emptyRemoteStore());
+        localStorage.removeItem(STORAGE_KEY);
+        setSessionReady(true);
+        return;
+      }
+      setSessionReady(false);
+      try {
+        const nextProfile = await getAppProfile(nextSession.user.id);
         if (!active) return;
-        setStore(remote);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(remote));
-        setDataStatus('connected');
-      })
-      .catch((error: unknown) => {
+        setProfile(nextProfile);
+        setSection(appSection(nextProfile.role));
+        setSessionReady(true);
+      } catch (error) {
+        await client.auth.signOut();
         if (!active) return;
-        setDataStatus('error');
+        setProfile(null);
+        setSessionReady(true);
         setNotice(
-          `Could not load Supabase data: ${error instanceof Error ? error.message : 'Unknown error'}`
+          `Account setup is incomplete: ${error instanceof Error ? error.message : 'profile unavailable'}`
         );
+      }
+    };
+    client.auth.getSession().then((result) => applySession(result.data.session));
+    const {
+      data: { subscription },
+    } = client.auth.onAuthStateChange((_event, nextSession) => {
+      queueMicrotask(() => {
+        void applySession(nextSession);
       });
+    });
     return () => {
       active = false;
+      subscription.unsubscribe();
     };
   }, []);
 
-  const persist = async (next: Store) => {
-    if (supabaseConfigured) {
-      await saveRemoteStore(next);
+  const refreshStore = useCallback(async () => {
+    if (!supabaseConfigured || !profile) return;
+    try {
+      const remote = await fetchRemoteStore();
+      setStore(remote);
       setDataStatus('connected');
+    } catch (error) {
+      setDataStatus('error');
+      setNotice(
+        `Could not sync Supabase data: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
     }
+  }, [profile]);
+
+  useEffect(() => {
+    if (!profile) return;
+    const initialRefresh = window.setTimeout(() => {
+      void refreshStore();
+    }, 0);
+    const refreshTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void refreshStore();
+    }, 20000);
+    return () => {
+      window.clearTimeout(initialRefresh);
+      window.clearInterval(refreshTimer);
+    };
+  }, [profile, refreshStore]);
+
+  const persist = async (next: Store) => {
     setStore(next);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    setDataStatus('connected');
     setNotice('Changes saved.');
   };
   const clientName = (id: string) =>
@@ -347,11 +424,7 @@ function App() {
       const count = todayPosts.filter(
         (post) => post.platformId === platform.id && post.status === 'Published'
       ).length;
-      const platformTarget =
-        platformTargets[platform.name] ??
-        store.accounts
-          .filter((a) => a.platformId === platform.id)
-          .reduce((n, a) => n + a.dailyTarget, 0);
+      const platformTarget = platform.dailyTarget;
       return {
         ...platform,
         count,
@@ -383,12 +456,22 @@ function App() {
   const savePost = async (value: Post) => {
     const exists = store.posts.some((p) => p.id === value.id);
     try {
-      await persist({
-        ...store,
-        posts: exists
-          ? store.posts.map((p) => (p.id === value.id ? value : p))
-          : [value, ...store.posts],
-      });
+      const post =
+        profile?.role === 'client'
+          ? {
+              ...value,
+              clientId: profile.clientId ?? '',
+              deviceId:
+                store.accounts.find((account) => account.id === value.accountId)?.deviceId ?? '',
+            }
+          : value;
+      await saveRemotePost(post);
+      const posts = exists
+        ? store.posts.map((current) => (current.id === post.id ? post : current))
+        : [post, ...store.posts];
+      const next = { ...store, posts };
+      setStore(next);
+      setNotice('Posting record saved.');
       setModal(null);
       setEditItem(null);
     } catch (error) {
@@ -404,12 +487,13 @@ function App() {
     const key = type.toLowerCase() as 'clients' | 'accounts' | 'platforms' | 'devices';
     const rows = store[key] as any[];
     try {
-      await persist({
-        ...store,
-        [key]: rows.some((r) => r.id === value.id)
-          ? rows.map((r) => (r.id === value.id ? value : r))
-          : [...rows, value],
-      });
+      await saveRemoteRecord(key, value);
+      const updatedRows = rows.some((r) => r.id === value.id)
+        ? rows.map((r) => (r.id === value.id ? value : r))
+        : [...rows, value];
+      const next = { ...store, [key]: updatedRows };
+      setStore(next);
+      setNotice('Changes saved.');
       setModal(null);
       setEditItem(null);
     } catch (error) {
@@ -426,6 +510,10 @@ function App() {
   };
   const confirmProtectedDelete = async () => {
     if (!deleteRequest || !deletePassword) return;
+    if (profile?.role !== 'admin') {
+      setDeleteError('Only an admin can delete records.');
+      return;
+    }
     setDeleteBusy(true);
     try {
       await requestProtectedDelete(deleteRequest.table, deleteRequest.id, deletePassword);
@@ -436,7 +524,6 @@ function App() {
         ),
       } as Store;
       setStore(next);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
       setDeleteRequest(null);
       setDeletePassword('');
       setNotice('Record deleted.');
@@ -496,6 +583,37 @@ function App() {
     link.click();
     URL.revokeObjectURL(link.href);
   };
+  const handleAuthenticated = () => {
+    if (!supabase) return;
+    void supabase.auth.getSession().then(async ({ data }) => {
+      if (!data.session) return;
+      try {
+        const nextProfile = await getAppProfile(data.session.user.id);
+        setProfile(nextProfile);
+        setSection(appSection(nextProfile.role));
+        setSessionReady(true);
+      } catch (error) {
+        setNotice(
+          `Could not load your account: ${error instanceof Error ? error.message : 'unknown error'}`
+        );
+      }
+    });
+  };
+
+  if (!sessionReady) {
+    return (
+      <main className="auth-loading">
+        <div className="brand-mark">
+          <Activity size={19} />
+        </div>
+        <span>Verifying workspace access…</span>
+      </main>
+    );
+  }
+  if (!profile) {
+    return <AuthScreen onAuthenticated={handleAuthenticated} />;
+  }
+  const isAdmin = profile.role === 'admin';
 
   const screenTitle = section === 'Dashboard' ? 'Good morning, team' : section;
   const postTable = (posts: Post[], showDate = true) => (
@@ -565,13 +683,15 @@ function App() {
                   >
                     <Pencil size={15} />
                   </button>
-                  <button
-                    className="icon-button row-action danger-button"
-                    onClick={() => deletePost(post.id)}
-                    aria-label="Delete post"
-                  >
-                    <Trash2 size={14} />
-                  </button>
+                  {isAdmin && (
+                    <button
+                      className="icon-button row-action danger-button"
+                      onClick={() => deletePost(post.id)}
+                      aria-label="Delete post"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  )}
                 </div>
               </td>
             </tr>
@@ -612,55 +732,75 @@ function App() {
           <ChevronDown size={15} />
         </div>
         <nav>
-          {['WORKSPACE', 'MANAGE', 'INSIGHTS'].map((group) => (
-            <div className="nav-group" key={group}>
-              <div className="nav-caption">{group}</div>
-              {navItems
-                .filter((item) => item.group === group)
-                .map(({ name, icon: Icon }) => (
-                  <button
-                    key={name}
-                    className={`nav-link ${section === name ? 'active' : ''}`}
-                    onClick={() => {
-                      setSection(name);
-                      setMobileNav(false);
-                    }}
-                  >
-                    <Icon size={17} strokeWidth={1.9} />
-                    <span>{name}</span>
-                    {name === 'Posting log' && <i className="nav-count">{todayPosts.length}</i>}
-                  </button>
-                ))}
-            </div>
-          ))}
+          {['WORKSPACE', 'MANAGE', 'INSIGHTS'].map(
+            (group) =>
+              navItems.some(
+                (item) => item.group === group && (isAdmin || item.name === 'Posting log')
+              ) && (
+                <div className="nav-group" key={group}>
+                  <div className="nav-caption">{group}</div>
+                  {navItems
+                    .filter(
+                      (item) => item.group === group && (isAdmin || item.name === 'Posting log')
+                    )
+                    .map(({ name, icon: Icon }) => (
+                      <button
+                        key={name}
+                        className={`nav-link ${section === name ? 'active' : ''}`}
+                        onClick={() => {
+                          setSection(name);
+                          setMobileNav(false);
+                        }}
+                      >
+                        <Icon size={17} strokeWidth={1.9} />
+                        <span>{name}</span>
+                        {name === 'Posting log' && <i className="nav-count">{todayPosts.length}</i>}
+                      </button>
+                    ))}
+                </div>
+              )
+          )}
         </nav>
         <div className="sidebar-bottom">
-          <div className="plan-card">
-            <div className="plan-icon">
-              <Sparkles size={15} />
+          {isAdmin && (
+            <div className="plan-card">
+              <div className="plan-icon">
+                <Sparkles size={15} />
+              </div>
+              <strong>Keep the momentum</strong>
+              <p>
+                Your team has published <b>{publishedToday} posts</b> today.
+              </p>
+              <button onClick={() => setSection('Reports')}>
+                View performance <ArrowUpRight size={14} />
+              </button>
             </div>
-            <strong>Keep the momentum</strong>
-            <p>
-              Your team has published <b>{publishedToday} posts</b> today.
-            </p>
-            <button onClick={() => setSection('Reports')}>
-              View performance <ArrowUpRight size={14} />
+          )}
+          {isAdmin && (
+            <button
+              className={`nav-link settings-link ${section === 'Settings' ? 'active' : ''}`}
+              onClick={() => setSection('Settings')}
+            >
+              <Settings size={17} />
+              <span>Settings</span>
             </button>
-          </div>
-          <button
-            className={`nav-link settings-link ${section === 'Settings' ? 'active' : ''}`}
-            onClick={() => setSection('Settings')}
-          >
-            <Settings size={17} />
-            <span>Settings</span>
-          </button>
+          )}
           <div className="profile">
-            <div className="profile-avatar">JL</div>
+            <div className="profile-avatar">{profile.username.slice(0, 2).toUpperCase()}</div>
             <div>
-              <strong>Jordan Lee</strong>
-              <small>Workspace admin</small>
+              <strong>{profile.username}</strong>
+              <small>{isAdmin ? 'Workspace admin' : clientName(profile.clientId ?? '')}</small>
             </div>
-            <MoreHorizontal size={18} />
+            <button
+              className="icon-button"
+              onClick={() => {
+                void signOut();
+              }}
+              aria-label="Sign out"
+              title="Sign out"
+            >
+              <LogOut size={16} />
+            </button>
           </div>
         </div>
       </aside>
@@ -698,7 +838,7 @@ function App() {
               {dataStatus === 'connecting'
                 ? 'Connecting to Supabase'
                 : dataStatus === 'connected'
-                  ? 'Supabase connected'
+                  ? `${isAdmin ? 'Admin' : 'Client'} · Supabase`
                   : dataStatus === 'error'
                     ? 'Database connection issue'
                     : 'Local preview'}
@@ -736,16 +876,23 @@ function App() {
                 {section === 'Dashboard' && <span className="wave">✦</span>}
               </h1>
               <p>
-                {section === 'Dashboard'
-                  ? 'Here’s what’s happening across your accounts today.'
-                  : section === 'Posting log' || section === 'History'
-                    ? 'Every post, one reliable source of truth.'
-                    : `Manage your ${section.toLowerCase()} and keep your operation running smoothly.`}
+                {!isAdmin
+                  ? `Manage posting activity for ${clientName(profile.clientId ?? '')}.`
+                  : section === 'Dashboard'
+                    ? 'Here’s what’s happening across your accounts today.'
+                    : section === 'Posting log' || section === 'History'
+                      ? 'Every post, one reliable source of truth.'
+                      : `Manage your ${section.toLowerCase()} and keep your operation running smoothly.`}
               </p>
             </div>
             <div className="heading-actions">
+              {isAdmin && section === 'Clients' && (
+                <button className="button button-secondary" onClick={() => setProvisionOpen(true)}>
+                  <KeyRound size={15} /> Create client login
+                </button>
+              )}
               {section === 'Dashboard' && (
-                <button className="button button-secondary" onClick={exportPosts}>
+                <button className="button button-secondary export-button" onClick={exportPosts}>
                   <Download size={16} /> Export
                 </button>
               )}
@@ -755,7 +902,7 @@ function App() {
             </div>
           </div>
 
-          {section === 'Dashboard' && (
+          {isAdmin && section === 'Dashboard' && (
             <DashboardView
               target={target}
               published={publishedToday}
@@ -770,7 +917,9 @@ function App() {
               todayLabel={todayLabel}
             />
           )}
-          {(section === 'Posting log' || section === 'History') && (
+          {(isAdmin
+            ? section === 'Posting log' || section === 'History'
+            : section === 'Posting log') && (
             <section className="panel records-panel">
               <div className="panel-header">
                 <div>
@@ -820,7 +969,7 @@ function App() {
               {postTable(filteredPosts)}
             </section>
           )}
-          {['Accounts', 'Clients', 'Platforms', 'Devices'].includes(section) && (
+          {isAdmin && ['Accounts', 'Clients', 'Platforms', 'Devices'].includes(section) && (
             <EntityView
               section={section}
               store={store}
@@ -832,7 +981,7 @@ function App() {
               onDelete={(id: string) => deleteRecord(section, id)}
             />
           )}
-          {section === 'Reports' && (
+          {isAdmin && section === 'Reports' && (
             <ReportsView
               posts={store.posts}
               clients={store.clients}
@@ -841,7 +990,7 @@ function App() {
               platformName={platformName}
             />
           )}
-          {section === 'Settings' && (
+          {isAdmin && section === 'Settings' && (
             <SettingsView
               store={store}
               remote={supabaseConfigured}
@@ -866,6 +1015,7 @@ function App() {
       {modal === 'post' && (
         <PostModal
           store={store}
+          clientProfile={profile.role === 'client' ? profile : undefined}
           initial={editItem?.type === 'post' ? editItem.value : undefined}
           onClose={() => {
             setModal(null);
@@ -899,6 +1049,14 @@ function App() {
         />
       )}
       {modal === 'post' && <></>}
+      {isAdmin && provisionOpen && (
+        <ClientProvisionModal
+          onClose={() => setProvisionOpen(false)}
+          onCreated={() => {
+            void refreshStore();
+          }}
+        />
+      )}
       {deleteRequest && (
         <DeleteModal
           target={deleteRequest}
@@ -1293,6 +1451,7 @@ function EntityView({
                 <>
                   <th>PLATFORM</th>
                   <th>ACCOUNTS</th>
+                  <th>DAILY TARGET</th>
                   <th>STATUS</th>
                   <th>NOTES</th>
                 </>
@@ -1373,6 +1532,7 @@ function EntityView({
                       <small>{row.id}</small>
                     </td>
                     <td>{store.accounts.filter((a: Account) => a.platformId === row.id).length}</td>
+                    <td>{row.dailyTarget} posts / day</td>
                     <td>
                       <span className={`status-pill ${row.active ? 'published' : 'cancelled'}`}>
                         <i />
@@ -1438,15 +1598,17 @@ function EntityView({
 function PostModal({
   store,
   initial,
+  clientProfile,
   onClose,
   onSave,
 }: {
   store: Store;
   initial?: Post;
+  clientProfile?: AppProfile;
   onClose: () => void;
   onSave: (post: Post) => void;
 }) {
-  const defaultClientId = store.clients[0]?.id ?? '';
+  const defaultClientId = clientProfile?.clientId ?? store.clients[0]?.id ?? '';
   const defaultAccount = store.accounts.find((account) => account.clientId === defaultClientId);
   const [form, setForm] = useState<Post>(
     initial ?? {
@@ -1525,17 +1687,26 @@ function PostModal({
               />
             </Field>
             <Field label="Client">
-              <select
-                required
-                value={form.clientId}
-                onChange={(e) => set('clientId', e.target.value)}
-              >
-                {store.clients.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
-                ))}
-              </select>
+              {clientProfile ? (
+                <input
+                  readOnly
+                  value={
+                    store.clients.find((client) => client.id === clientProfile.clientId)?.name ?? ''
+                  }
+                />
+              ) : (
+                <select
+                  required
+                  value={form.clientId}
+                  onChange={(e) => set('clientId', e.target.value)}
+                >
+                  {store.clients.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              )}
             </Field>
             <Field label="Account">
               <select
@@ -1564,7 +1735,11 @@ function PostModal({
               </select>
             </Field>
             <Field label="Device">
-              <select value={form.deviceId} onChange={(e) => set('deviceId', e.target.value)}>
+              <select
+                disabled={Boolean(clientProfile)}
+                value={selectedAccount?.deviceId ?? form.deviceId}
+                onChange={(e) => set('deviceId', e.target.value)}
+              >
                 <option value="">No device</option>
                 {store.devices.map((d) => (
                   <option key={d.id} value={d.id}>
@@ -1767,7 +1942,7 @@ function RecordModal({
       (section === 'Clients'
         ? { id, name: '', contact: '', dailyTarget: 5, status: 'Active', remarks: '' }
         : section === 'Platforms'
-          ? { id, name: '', active: true, color: '#536fe4', notes: '' }
+          ? { id, name: '', active: true, color: '#536fe4', dailyTarget: 0, notes: '' }
           : section === 'Devices'
             ? { id, name: '', type: 'Android', assignedTo: '', status: 'Active', remarks: '' }
             : {
@@ -1936,6 +2111,15 @@ function RecordModal({
                     value={form.name}
                     onChange={(e) => set('name', e.target.value)}
                     placeholder="e.g. Threads"
+                  />
+                </Field>
+                <Field label="Daily post target">
+                  <input
+                    required
+                    type="number"
+                    min="0"
+                    value={form.dailyTarget ?? 0}
+                    onChange={(e) => set('dailyTarget', Number(e.target.value))}
                   />
                 </Field>
                 <Field label="Status">

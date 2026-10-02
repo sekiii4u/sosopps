@@ -17,7 +17,14 @@ export type Client = {
   status: string;
   remarks: string;
 };
-export type Platform = { id: string; name: string; active: boolean; color: string; notes: string };
+export type Platform = {
+  id: string;
+  name: string;
+  active: boolean;
+  color: string;
+  dailyTarget: number;
+  notes: string;
+};
 export type Device = {
   id: string;
   name: string;
